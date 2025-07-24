@@ -1,0 +1,7 @@
+﻿---
+BasedOnStyle: Chromium
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BreakBeforeBraces: Allman
+IndentWidth: '4'
+
+...
