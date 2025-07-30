@@ -4,7 +4,7 @@
 
 ![download](https://img.shields.io/github/downloads/ONdraid/Real-ESRGAN-ncnn-vulkan-improved/total)
 ![support](https://img.shields.io/badge/Support-Linux%20x64-blue?logo=Linux)
-![license](https://img.shields.io/github/license/ONdraid/Real-ESRGAN-ncnn-vulkan-improved.svg)
+![license](https://img.shields.io/github/license/ONdraid/Real-ESRGAN-ncnn-vulkan-improved)
 
 </div>
 
@@ -28,7 +28,9 @@ You can download the latest release from the [Releases page](https://github.com/
 
 <details>
 <summary>Dependencies</summary>
-- libpng, ... (TODO: add rest of dependencies)
+
+> libpng, ... (TODO: add rest of dependencies)
+
 </details>
 
 ```shell
