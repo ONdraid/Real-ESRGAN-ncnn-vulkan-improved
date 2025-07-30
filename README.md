@@ -55,7 +55,7 @@ You can create a full ffmpeg pipeline to upscale a video!
 ffmpeg \
 -hide_banner -loglevel error \
 -i input.mkv -f image2pipe -vcodec png - \
-| ./realesrgan-ncnn-vulkan \
+| ./realesrgan-ncnn-vulkan-improved \
 -n realesr-animevideov3 -s 2 \
 | ffmpeg \
 -f image2pipe -vcodec png -i - output.mkv
@@ -67,7 +67,7 @@ ffmpeg \
 ### Full usage
 
 ```
-Usage: realesrgan-ncnn-vulkan [options]...
+Usage: realesrgan-ncnn-vulkan-improved [options]...
 
   -h                   show this help
   -i input-path        input image path (jpg/png/webp) or directory (reads from stdin if not provided)
