@@ -28,6 +28,9 @@ find_package(Threads)
 find_package(OpenMP)
 find_package(Vulkan REQUIRED)
 
+# Find libpng for fast PNG writing
+find_package(PNG REQUIRED)
+
 find_program(GLSLANGVALIDATOR_EXECUTABLE NAMES glslangValidator PATHS $ENV{VULKAN_SDK}/bin NO_CMAKE_FIND_ROOT_PATH)
 message(STATUS "Found glslangValidator: ${GLSLANGVALIDATOR_EXECUTABLE}")
 
@@ -278,7 +281,7 @@ add_executable(realesrgan-ncnn-vulkan main.cpp realesrgan.cpp)
 
 add_dependencies(realesrgan-ncnn-vulkan generate-spirv)
 
-set(REALESRGAN_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY})
+set(REALESRGAN_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY} PNG::PNG)
 
 if(USE_STATIC_MOLTENVK)
     find_library(CoreFoundation NAMES CoreFoundation)

@@ -23,6 +23,10 @@ namespace fs = std::filesystem;
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+// libpng for fast PNG writing
+#include <png.h>
+#include <setjmp.h>
+#include <zlib.h>
 #endif  // _WIN32
 #include "webp_image.h"
 
@@ -99,41 +103,163 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
 static void print_usage()
 {
-    fprintf(
-        stderr,
-        "Usage: realesrgan-ncnn-vulkan -i infile -o outfile [options]...\n\n"
-        "  -h                   show this help\n"
+    fprintf(stderr,
+            "Usage: realesrgan-ncnn-vulkan [options]...\n\n"
 
-        "  -i input-path        input image path (jpg/png/webp) or "
-        "directory\n"
+            "  -h                   show this help\n"
 
-        "  -o output-path       output image path (jpg/png/webp) or "
-        "directory\n"
+            "  -i input-path        input image path (jpg/png/webp) or "
+            "directory (reads from stdin if not provided)\n"
 
-        "  -s scale             upscale ratio (can be 2, 3, 4. default=4)\n"
-        "  -t tile-size         tile size (>=32/0=auto, default=0) can be "
-        "0,0,0 for multi-gpu\n"
+            "  -o output-path       output image path (jpg/png/webp) or "
+            "directory (outputs to stdout if not provided)\n"
 
-        "  -m model-path        folder path to the pre-trained models. "
-        "default=models\n"
+            "  -s scale             upscale ratio (can be 2, 3, 4. default=4)\n"
+            "  -t tile-size         tile size (>=32/0=auto, default=0) can be "
+            "0,0,0 for multi-gpu\n"
 
-        "  -n model-name        model name (default=realesr-animevideov3, "
-        "can be realesr-animevideov3 | realesrgan-x4plus | "
-        "realesrgan-x4plus-anime | realesrnet-x4plus)\n"
+            "  -m model-path        folder path to the pre-trained models. "
+            "default=models\n"
 
-        "  -g gpu-id            gpu device to use (default=auto) can be "
-        "0,1,2 for multi-gpu\n"
+            "  -n model-name        model name (default=realesr-animevideov3, "
+            "can be realesr-animevideov3 | realesrgan-x4plus | "
+            "realesrgan-x4plus-anime | realesrnet-x4plus)\n"
 
-        "  -j load:proc:save    thread count for load/proc/save "
-        "(default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n"
+            "  -g gpu-id            gpu device to use (default=auto) can be "
+            "0,1,2 for multi-gpu\n"
 
-        "  -x                   enable tta mode\n"
+            "  -j load:proc:save    thread count for load/proc/save "
+            "(default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n"
 
-        "  -f format            output image format (jpg/png/webp, "
-        "default=ext/png)\n"
+            "  -x                   enable tta mode\n"
 
-        "  -v                   verbose output\n");
+            "  -f format            output image format (jpg/png/webp, "
+            "default=ext/png)\n"
+
+            "  -v                   verbose output\n");
 }
+
+#if !_WIN32
+// fast PNG writer using libpng with no compression
+struct png_memory_writer_state
+{
+    unsigned char* buffer;
+    size_t size;
+    size_t capacity;
+};
+
+static void png_write_to_memory(png_structp png_ptr,
+                                png_bytep data,
+                                png_size_t length)
+{
+    png_memory_writer_state* state =
+        (png_memory_writer_state*)png_get_io_ptr(png_ptr);
+
+    // resize buffer if needed
+    if (state->size + length > state->capacity)
+    {
+        size_t new_capacity = state->capacity * 2;
+        if (new_capacity < state->size + length)
+        {
+            new_capacity = state->size + length;
+        }
+        unsigned char* new_buffer =
+            (unsigned char*)realloc(state->buffer, new_capacity);
+        if (!new_buffer)
+        {
+            png_error(png_ptr, "Memory allocation failed");
+        }
+        state->buffer = new_buffer;
+        state->capacity = new_capacity;
+    }
+
+    memcpy(state->buffer + state->size, data, length);
+    state->size += length;
+}
+
+static void png_flush_memory(png_structp png_ptr)
+{
+    // no-op for memory writing
+}
+
+static unsigned char* write_png_to_mem_fast(const unsigned char* data,
+                                            int width,
+                                            int height,
+                                            int channels,
+                                            int* out_len)
+{
+    png_structp png_ptr =
+        png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) return NULL;
+
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr)
+    {
+        png_destroy_write_struct(&png_ptr, NULL);
+        return NULL;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr)))
+    {
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        return NULL;
+    }
+
+    // set up memory writer
+    png_memory_writer_state state = {0};
+    state.capacity = width * height * channels + 1024;  // Initial capacity
+    state.buffer = (unsigned char*)malloc(state.capacity);
+    if (!state.buffer)
+    {
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        return NULL;
+    }
+
+    png_set_write_fn(png_ptr, &state, png_write_to_memory, png_flush_memory);
+
+    // set PNG parameters for maximum speed (no compression)
+    int color_type;
+    switch (channels)
+    {
+        case 1:
+            color_type = PNG_COLOR_TYPE_GRAY;
+            break;
+        case 3:
+            color_type = PNG_COLOR_TYPE_RGB;
+            break;
+        case 4:
+            color_type = PNG_COLOR_TYPE_RGBA;
+            break;
+        default:
+            free(state.buffer);
+            png_destroy_write_struct(&png_ptr, &info_ptr);
+            return NULL;
+    }
+
+    png_set_IHDR(png_ptr, info_ptr, width, height, 8, color_type,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+
+    // set compression level to 0 for maximum speed
+    png_set_compression_level(png_ptr, 0);
+    png_set_compression_strategy(png_ptr, Z_DEFAULT_STRATEGY);
+
+    png_write_info(png_ptr, info_ptr);
+
+    // write image data
+    for (int y = 0; y < height; y++)
+    {
+        png_write_row(png_ptr, (png_const_bytep)(data + y * width * channels));
+    }
+
+    png_write_end(png_ptr, NULL);
+
+    *out_len = (int)state.size;
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+
+    return state.buffer;
+}
+#endif
 
 class Task
 {
@@ -195,11 +321,115 @@ class TaskQueue
 TaskQueue toproc;
 TaskQueue tosave;
 
+static int read_bytes(unsigned char* buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n)
+    {
+        ssize_t r = fread(buf + got, 1, n - got, stdin);
+        if (r <= 0) return 0;
+        got += r;
+    }
+    return 1;
+}
+
+void read_png(unsigned char* sig_buf,
+              unsigned char* len_buf,
+              unsigned char* type_buf,
+              unsigned char*& img_buf,
+              size_t& buf_cap,
+              size_t& buf_len)
+{
+    const static unsigned char png_sig[8] = {0x89, 'P',  'N',  'G',
+                                             0x0D, 0x0A, 0x1A, 0x0A};
+
+    // signature
+    if (!read_bytes(sig_buf, 8)) return;
+    if (memcmp(sig_buf, png_sig, 8))
+    {
+        fprintf(stderr, "Not PNG\n");
+        return;
+    }
+
+    // ensure buffer can hold at least signature
+    if (buf_cap < 8)
+    {
+        buf_cap = 8;
+        unsigned char* new_buf = (unsigned char*)realloc(img_buf, buf_cap);
+        if (!new_buf)
+        {
+            fprintf(stderr, "Failed to allocate memory for PNG buffer\n");
+            return;
+        }
+        img_buf = new_buf;
+    }
+    memcpy(img_buf, sig_buf, 8);
+    buf_len = 8;
+
+    // read chunks until IEND
+    for (;;)
+    {
+        if (!read_bytes(len_buf, 4)) return;
+        if (!read_bytes(type_buf, 4)) return;
+        // chunk length (big-endian)
+        uint32_t chunk_len = (len_buf[0] << 24) | (len_buf[1] << 16) |
+                             (len_buf[2] << 8) | len_buf[3];
+
+        // validate chunk length to prevent overflow and excessive allocation
+        if (chunk_len > 0x7FFFFFFF || chunk_len > 100 * 1024 * 1024)
+        {
+            fprintf(stderr, "PNG chunk too large: %u bytes\n", chunk_len);
+            return;
+        }
+
+        // ensure capacity
+        size_t needed = buf_len + 4 + 4 + chunk_len + 4;
+        if (needed > buf_cap)
+        {
+            // check for potential overflow
+            if (needed < buf_len)
+            {
+                fprintf(stderr, "PNG buffer size overflow\n");
+                return;
+            }
+
+            buf_cap = needed * 1.5;
+            unsigned char* new_buf = (unsigned char*)realloc(img_buf, buf_cap);
+            if (!new_buf)
+            {
+                fprintf(stderr, "Failed to allocate memory for PNG chunk\n");
+                return;
+            }
+            img_buf = new_buf;
+        }
+        // copy length+type
+        memcpy(img_buf + buf_len, len_buf, 4);
+        buf_len += 4;
+        memcpy(img_buf + buf_len, type_buf, 4);
+        buf_len += 4;
+
+        // copy data
+        if (!read_bytes(img_buf + buf_len, chunk_len)) return;
+        buf_len += chunk_len;
+        // copy CRC
+        if (!read_bytes(img_buf + buf_len, 4)) return;
+        buf_len += 4;
+
+        // check for IEND
+        if (memcmp(type_buf, "IEND", 4) == 0)
+        {
+            break;
+        }
+    }
+}
+
 class LoadThreadParams
 {
    public:
     int scale;
     int jobs_load;
+    int use_stdin;
+    int use_stdout;
 
     // session data
     std::vector<path_t> input_files;
@@ -209,14 +439,22 @@ class LoadThreadParams
 void* load(void* args)
 {
     const LoadThreadParams* ltp = (const LoadThreadParams*)args;
-    const int count = ltp->input_files.size();
     const int scale = ltp->scale;
 
-#pragma omp parallel for schedule(static, 1) num_threads(ltp->jobs_load)
-    for (int i = 0; i < count; i++)
-    {
-        const path_t& imagepath = ltp->input_files[i];
+    int count;
+    if (ltp->use_stdin)
+        count = 1;
+    else
+        count = ltp->input_files.size();
 
+    unsigned char sig_buf[8];
+    unsigned char len_buf[4], type_buf[4];
+    unsigned char* img_buf = NULL;
+    size_t buf_cap = 0, buf_len = 0;
+
+    int i = 0;
+    while (i++ < count)
+    {
         int webp = 0;
 
         unsigned char* pixeldata = 0;
@@ -224,11 +462,17 @@ void* load(void* args)
         int h;
         int c;
 
+        FILE* fp = NULL;
+
+        if (!ltp->use_stdin)
+        {
 #if _WIN32
-        FILE* fp = _wfopen(imagepath.c_str(), L"rb");
+            fp = _wfopen(imagepath.c_str(), L"rb");
 #else
-        FILE* fp = fopen(imagepath.c_str(), "rb");
+            fp = fopen(ltp->input_files[i].c_str(), "rb");
 #endif
+        }
+
         if (fp)
         {
             // read whole file
@@ -287,12 +531,46 @@ void* load(void* args)
                 free(filedata);
             }
         }
+        // read from stdin
+        else if (ltp->use_stdin)
+        {
+            read_png(sig_buf, len_buf, type_buf, img_buf, buf_cap, buf_len);
+            pixeldata = stbi_load_from_memory(img_buf, buf_len, &w, &h, &c, 0);
+            if (pixeldata)
+            {
+                // stb_image auto channel
+                if (c == 1)
+                {
+                    // grayscale -> rgb
+                    stbi_image_free(pixeldata);
+                    pixeldata =
+                        stbi_load_from_memory(img_buf, buf_len, &w, &h, &c, 3);
+                    c = 3;
+                }
+                else if (c == 2)
+                {
+                    // grayscale + alpha -> rgba
+                    stbi_image_free(pixeldata);
+                    pixeldata =
+                        stbi_load_from_memory(img_buf, buf_len, &w, &h, &c, 4);
+                    c = 4;
+                }
+            }
+        }
+
         if (pixeldata)
         {
             Task v;
             v.id = i;
-            v.inpath = imagepath;
-            v.outpath = ltp->output_files[i];
+            if (ltp->use_stdin)
+                v.inpath = PATHSTR("stdin");
+            else
+                v.inpath = ltp->input_files[i];
+
+            if (ltp->use_stdout)
+                v.outpath = PATHSTR("stdout");
+            else
+                v.outpath = ltp->output_files[i];
 
             v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
             v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)c, c);
@@ -312,21 +590,41 @@ void* load(void* args)
 #else   // _WIN32
                 fprintf(stderr,
                         "image %s has alpha channel ! %s will output %s\n",
-                        imagepath.c_str(), imagepath.c_str(),
-                        output_filename2.c_str());
+                        ltp->input_files[i].c_str(),
+                        ltp->input_files[i].c_str(), output_filename2.c_str());
 #endif  // _WIN32
             }
 
             toproc.put(v);
+
+            if (ltp->use_stdin)
+            {
+                if (img_buf)
+                {
+                    free(img_buf);
+                    img_buf = NULL;
+                }
+
+                buf_cap = 0;
+                buf_len = 0;
+                count++;
+            }
         }
         else
         {
 #if _WIN32
             fwprintf(stderr, L"decode image %ls failed\n", imagepath.c_str());
 #else   // _WIN32
-            fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
+            fprintf(stderr, "decode image %s failed\n",
+                    ltp->input_files[i].c_str());
 #endif  // _WIN32
         }
+    }
+
+    if (img_buf)
+    {
+        free(img_buf);
+        img_buf = NULL;
     }
 
     return 0;
@@ -363,6 +661,7 @@ class SaveThreadParams
 {
    public:
     int verbose;
+    int use_stdout;
 };
 
 void* save(void* args)
@@ -396,19 +695,54 @@ void* save(void* args)
         }
 
         int success = 0;
+        path_t ext;
 
-        path_t ext = get_file_extension(v.outpath);
-
-        /* ----------- Create folder if not exists -------------------*/
-        fs::path fs_path = fs::absolute(v.outpath);
-        std::string parent_path = fs_path.parent_path().string();
-        if (fs::exists(parent_path) != 1)
+        if (!stp->use_stdout)
         {
-            std::cout << "Create folder: [" << parent_path << "]." << std::endl;
-            fs::create_directories(parent_path);
+            ext = get_file_extension(v.outpath);
+
+            /* ----------- Create folder if not exists -------------------*/
+            fs::path fs_path = fs::absolute(v.outpath);
+            std::string parent_path = fs_path.parent_path().string();
+            if (fs::exists(parent_path) != 1)
+            {
+                std::cout << "Create folder: [" << parent_path << "]."
+                          << std::endl;
+                fs::create_directories(parent_path);
+            }
         }
 
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        if (stp->use_stdout)
+        {
+            int len;
+#if _WIN32
+            unsigned char* png = stbi_write_png_to_mem(
+                (const unsigned char*)v.outimage.data, 0, v.outimage.w,
+                v.outimage.h, v.outimage.elempack, &len);
+#else
+            // use fast libpng implementation with no compression
+            unsigned char* png = write_png_to_mem_fast(
+                (const unsigned char*)v.outimage.data, v.outimage.w,
+                v.outimage.h, v.outimage.elempack, &len);
+#endif
+
+            if (png != NULL)
+            {
+#if _WIN32
+
+#else
+                fwrite(png, 1, len, stdout);
+                fflush(stdout);
+#endif
+#if _WIN32
+                STBIW_FREE(png);
+#else
+                free(png);
+#endif
+                success = 1;
+            }
+        }
+        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
         {
             success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h,
                                 v.outimage.elempack,
@@ -580,10 +914,15 @@ int main(int argc, char** argv)
     }
 #endif  // _WIN32
 
-    if (inputpath.empty() || outputpath.empty())
+    if (inputpath.empty())
     {
-        print_usage();
-        return -1;
+        fprintf(stderr, "using stdin as input\n");
+    }
+
+    if (outputpath.empty())
+    {
+        fprintf(stderr, "using stdout as output\n");
+        stbi_write_png_compression_level = 0;
     }
 
     if (tilesize.size() != (gpuid.empty() ? 1 : gpuid.size()) &&
@@ -624,7 +963,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (!path_is_directory(outputpath) && !outputpath.empty())
     {
         // guess format from outputpath no matter what format argument specified
         path_t ext = get_file_extension(outputpath);
@@ -814,6 +1153,9 @@ int main(int argc, char** argv)
     jobs_load = std::min(jobs_load, cpu_count);
     jobs_save = std::min(jobs_save, cpu_count);
 
+    if (inputpath.empty()) jobs_load = 1;
+    if (outputpath.empty()) jobs_save = 1;
+
     int gpu_count = ncnn::get_gpu_count();
     for (int i = 0; i < use_gpu_count; i++)
     {
@@ -879,6 +1221,16 @@ int main(int argc, char** argv)
             ltp.input_files = input_files;
             ltp.output_files = output_files;
 
+            if (inputpath.empty())
+                ltp.use_stdin = 1;
+            else
+                ltp.use_stdin = 0;
+
+            if (outputpath.empty())
+                ltp.use_stdout = 1;
+            else
+                ltp.use_stdout = 0;
+
             ncnn::Thread load_thread(load, (void*)&ltp);
 
             // realesrgan proc
@@ -904,6 +1256,10 @@ int main(int argc, char** argv)
             // save image
             SaveThreadParams stp;
             stp.verbose = verbose;
+            if (outputpath.empty())
+                stp.use_stdout = 1;
+            else
+                stp.use_stdout = 0;
 
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i = 0; i < jobs_save; i++)
