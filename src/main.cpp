@@ -104,7 +104,7 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 static void print_usage()
 {
     fprintf(stderr,
-            "Usage: realesrgan-ncnn-vulkan [options]...\n\n"
+            "Usage: realesrgan-ncnn-vulkan-improved [options]...\n\n"
 
             "  -h                   show this help\n"
 
