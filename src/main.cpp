@@ -4,6 +4,7 @@
 #include <clocale>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <queue>
 #include <vector>
 namespace fs = std::filesystem;
@@ -274,6 +275,15 @@ class Task
     ncnn::Mat outimage;
 };
 
+// comparator for priority queue (lower id has higher priority)
+struct TaskComparator
+{
+    bool operator()(const Task& a, const Task& b)
+    {
+        return a.id > b.id;  // cigher id has lower priority
+    }
+};
+
 class TaskQueue
 {
    public:
@@ -304,7 +314,7 @@ class TaskQueue
             condition.wait(lock);
         }
 
-        v = tasks.front();
+        v = tasks.top();
         tasks.pop();
 
         lock.unlock();
@@ -315,11 +325,57 @@ class TaskQueue
    private:
     ncnn::Mutex lock;
     ncnn::ConditionVariable condition;
-    std::queue<Task> tasks;
+    std::priority_queue<Task, std::vector<Task>, TaskComparator> tasks;
+};
+
+class SequentialTaskQueue
+{
+   public:
+    SequentialTaskQueue() : next_id(1) {}
+
+    void put(const Task& v)
+    {
+        lock.lock();
+
+        while (tasks.size() >= 8)  // FIXME hardcode queue length
+        {
+            condition.wait(lock);
+        }
+
+        tasks[v.id] = v;
+
+        lock.unlock();
+
+        condition.signal();
+    }
+
+    void get(Task& v)
+    {
+        lock.lock();
+
+        while (tasks.find(next_id) == tasks.end())
+        {
+            condition.wait(lock);
+        }
+
+        v = tasks[next_id];
+        tasks.erase(next_id);
+        next_id++;
+
+        lock.unlock();
+
+        condition.signal();
+    }
+
+   private:
+    ncnn::Mutex lock;
+    ncnn::ConditionVariable condition;
+    std::map<int, Task> tasks;
+    int next_id;
 };
 
 TaskQueue toproc;
-TaskQueue tosave;
+SequentialTaskQueue tosave;
 
 static int read_bytes(unsigned char* buf, size_t n)
 {
