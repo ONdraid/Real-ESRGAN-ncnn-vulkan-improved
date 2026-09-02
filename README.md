@@ -29,7 +29,11 @@ You can download the latest release from the [Releases page](https://github.com/
 <details>
 <summary>Dependencies</summary>
 
-> libpng, ... (TODO: add rest of dependencies)
+**Arch Linux**
+```shell
+sudo pacman -S base-devel cmake libpng glslang vulkan-headers vulkan-icd-loader openmp
+```
+*(Alternatively, you can install the `vulkan-devel` group which will pull in `glslang`, `vulkan-headers`, `vulkan-icd-loader`, and other Vulkan development tools automatically).*
 
 </details>
 
