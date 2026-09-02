@@ -14,9 +14,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
 
-project(realesrgan-ncnn-vulkan-improved)
-
 cmake_minimum_required(VERSION 3.9)
+
+project(realesrgan-ncnn-vulkan-improved)
 
 set(CMAKE_BUILD_TYPE Release)
 
@@ -228,8 +228,8 @@ if(NOT USE_SYSTEM_NCNN)
     option(WITH_LAYER_gemm "" OFF)
     option(WITH_LAYER_groupnorm "" OFF)
     option(WITH_LAYER_layernorm "" OFF)
-    option(WITH_LAYER_softplus "" OFF)
-
+    # Suppress error in CMake 4.0+ where ncnn requests CMake 2.8.12
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     add_subdirectory(ncnn)
 endif()
 
