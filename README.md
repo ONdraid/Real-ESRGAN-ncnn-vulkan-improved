@@ -68,13 +68,9 @@ cmake --build . -j 4
 You can create a full ffmpeg pipeline to upscale a video!
 
 ```shell
-ffmpeg \
--hide_banner -loglevel error \
--i input.mkv -f image2pipe -vcodec png - \
-| ./realesrgan-ncnn-vulkan-improved \
--n realesr-animevideov3 -s 2 \
-| ffmpeg \
--f image2pipe -vcodec png -i - output.mkv
+ffmpeg -hide_banner -loglevel error -i input.mkv -f image2pipe -vcodec png - \
+| ./realesrgan-ncnn-vulkan-improved -n realesr-animevideov3 -s 2 \
+| ffmpeg -f image2pipe -vcodec png -i - output.mkv
 ```
 
 > [!TIP]
