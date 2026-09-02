@@ -29,11 +29,23 @@ You can download the latest release from the [Releases page](https://github.com/
 <details>
 <summary>Dependencies</summary>
 
-**Arch Linux**
+#### Arch Linux
+
 ```shell
 sudo pacman -S base-devel cmake libpng glslang vulkan-headers vulkan-icd-loader openmp
 ```
-*(Alternatively, you can install the `vulkan-devel` group which will pull in `glslang`, `vulkan-headers`, `vulkan-icd-loader`, and other Vulkan development tools automatically).*
+
+#### Debian / Ubuntu
+
+```shell
+sudo apt install build-essential cmake libpng-dev glslang-dev libvulkan-dev libomp-dev
+```
+
+#### Fedora / RHEL
+
+```shell
+sudo dnf install gcc gcc-c++ make cmake libpng-devel glslang vulkan-headers vulkan-loader-devel libomp-devel
+```
 
 </details>
 
