@@ -1,4 +1,26 @@
 // realesrgan implemented with ncnn library
+//
+// This application performs AI-based image super-resolution (upscaling) using
+// Real-ESRGAN neural network models accelerated by Vulkan GPU compute via the
+// ncnn inference framework.
+//
+// Architecture overview:
+//   The program uses a producer-consumer pipeline with three stages running
+//   on separate threads:
+//     1. LOAD thread  — reads and decodes input images (from files or stdin)
+//     2. PROC threads — runs the Real-ESRGAN neural network inference on GPU
+//     3. SAVE threads — encodes and writes the upscaled output images
+//
+//   Two thread-safe queues connect the stages:
+//     toproc: load → proc  (priority queue, processes lowest ID first)
+//     tosave: proc → save  (sequential queue, guarantees output ordering)
+//
+//   Multi-GPU support: multiple proc threads can be spawned across different
+//   GPUs, each with its own RealESRGAN instance and tile size.
+
+// ============================================================================
+// Standard library includes
+// ============================================================================
 #include <stdio.h>
 #include <algorithm>
 #include <clocale>
@@ -9,6 +31,13 @@
 #include <vector>
 namespace fs = std::filesystem;
 
+// ============================================================================
+// Platform-specific image I/O
+// ============================================================================
+// On Windows, use WIC (Windows Imaging Component) for image decoding/encoding.
+// On Linux/macOS, use stb_image (header-only library) for decoding and
+// stb_image_write for encoding. Additionally, libpng is used for a fast
+// zero-compression PNG writer optimized for stdout piping.
 #if _WIN32
 // image decoder and encoder with wic
 #include "wic_image.h"
@@ -31,10 +60,20 @@ namespace fs = std::filesystem;
 #endif  // _WIN32
 #include "webp_image.h"
 
+// ============================================================================
+// Platform-specific command-line argument parsing
+// ============================================================================
+// Windows does not provide POSIX getopt(), so a minimal wide-character
+// implementation is provided here. The parse_optarg_int_array helper parses
+// comma-separated integer lists (e.g. "0,1,2") used for multi-GPU and
+// tile-size arguments.
 #if _WIN32
 #include <wchar.h>
 static wchar_t* optarg = NULL;
 static int optind = 1;
+
+// Minimal getopt implementation for wide-character argv on Windows.
+// Supports options with required arguments (indicated by ':' in optstring).
 static wchar_t getopt(int argc, wchar_t* const argv[], const wchar_t* optstring)
 {
     if (optind >= argc || argv[optind][0] != L'-') return -1;
@@ -58,6 +97,8 @@ static wchar_t getopt(int argc, wchar_t* const argv[], const wchar_t* optstring)
     return opt;
 }
 
+// Parse a comma-separated list of integers from a wide-character string.
+// Example: L"100,200,300" → {100, 200, 300}
 static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
 {
     std::vector<int> array;
@@ -76,6 +117,8 @@ static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
 #else                // _WIN32
 #include <unistd.h>  // getopt()
 
+// Parse a comma-separated list of integers from a string.
+// Example: "100,200,300" → {100, 200, 300}
 static std::vector<int> parse_optarg_int_array(const char* optarg)
 {
     std::vector<int> array;
@@ -93,15 +136,20 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 }
 #endif               // _WIN32
 
-// ncnn
+// ============================================================================
+// ncnn framework includes
+// ============================================================================
 #include "cpu.h"
 #include "gpu.h"
 #include "platform.h"
 
+// Real-ESRGAN model wrapper (handles tiling, padding, and inference)
 #include "realesrgan.h"
 
+// Cross-platform filesystem path utilities (path_t, PATHSTR, etc.)
 #include "filesystem_utils.h"
 
+// Print the command-line usage/help message to stderr.
 static void print_usage()
 {
     fprintf(stderr,
@@ -140,15 +188,25 @@ static void print_usage()
             "  -v                   verbose output\n");
 }
 
+// ============================================================================
+// Fast PNG writer (non-Windows only)
+// ============================================================================
+// Uses libpng with zero compression (compression level 0) to encode PNG data
+// into an in-memory buffer. This is significantly faster than stb_image_write
+// for stdout piping scenarios where encoding speed matters more than file size.
 #if !_WIN32
-// fast PNG writer using libpng with no compression
+
+// State for the in-memory PNG writer callback. Tracks a dynamically-growing
+// buffer that receives the raw PNG byte stream.
 struct png_memory_writer_state
 {
-    unsigned char* buffer;
-    size_t size;
-    size_t capacity;
+    unsigned char* buffer;  // Dynamically allocated output buffer
+    size_t size;            // Current number of bytes written
+    size_t capacity;        // Total allocated capacity of buffer
 };
 
+// libpng write callback: appends data to the in-memory buffer, growing it
+// with a doubling strategy when capacity is exceeded.
 static void png_write_to_memory(png_structp png_ptr,
                                 png_bytep data,
                                 png_size_t length)
@@ -178,17 +236,31 @@ static void png_write_to_memory(png_structp png_ptr,
     state->size += length;
 }
 
+// libpng flush callback: no-op since we're writing to memory, not a file.
 static void png_flush_memory(png_structp png_ptr)
 {
     // no-op for memory writing
 }
 
+// Encode raw pixel data as a PNG image into a malloc'd memory buffer.
+// Uses compression level 0 (no compression) for maximum encoding speed.
+//
+// Parameters:
+//   data     - raw pixel data in row-major order (GRAY, RGB, or RGBA)
+//   width    - image width in pixels
+//   height   - image height in pixels
+//   channels - number of color channels (1=gray, 3=RGB, 4=RGBA)
+//   out_len  - [out] receives the size of the encoded PNG data in bytes
+//
+// Returns: malloc'd buffer containing the PNG data, or NULL on failure.
+//          Caller is responsible for free()'ing the returned buffer.
 static unsigned char* write_png_to_mem_fast(const unsigned char* data,
                                             int width,
                                             int height,
                                             int channels,
                                             int* out_len)
 {
+    // Create the libpng write and info structs
     png_structp png_ptr =
         png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png_ptr) return NULL;
@@ -200,13 +272,14 @@ static unsigned char* write_png_to_mem_fast(const unsigned char* data,
         return NULL;
     }
 
+    // libpng error handling via setjmp (standard libpng pattern)
     if (setjmp(png_jmpbuf(png_ptr)))
     {
         png_destroy_write_struct(&png_ptr, &info_ptr);
         return NULL;
     }
 
-    // set up memory writer
+    // set up memory writer with an initial capacity estimate
     png_memory_writer_state state = {0};
     state.capacity = width * height * channels + 1024;  // Initial capacity
     state.buffer = (unsigned char*)malloc(state.capacity);
@@ -216,9 +289,10 @@ static unsigned char* write_png_to_mem_fast(const unsigned char* data,
         return NULL;
     }
 
+    // Redirect libpng output to our in-memory writer instead of a FILE*
     png_set_write_fn(png_ptr, &state, png_write_to_memory, png_flush_memory);
 
-    // set PNG parameters for maximum speed (no compression)
+    // Map channel count to PNG color type
     int color_type;
     switch (channels)
     {
@@ -237,17 +311,19 @@ static unsigned char* write_png_to_mem_fast(const unsigned char* data,
             return NULL;
     }
 
+    // Write the PNG header (IHDR chunk): 8-bit depth, no interlacing
     png_set_IHDR(png_ptr, info_ptr, width, height, 8, color_type,
                  PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
                  PNG_FILTER_TYPE_DEFAULT);
 
-    // set compression level to 0 for maximum speed
+    // Disable compression entirely for maximum encoding speed.
+    // The resulting file will be larger but encoding is ~10x faster.
     png_set_compression_level(png_ptr, 0);
     png_set_compression_strategy(png_ptr, Z_DEFAULT_STRATEGY);
 
     png_write_info(png_ptr, info_ptr);
 
-    // write image data
+    // Write image data row by row
     for (int y = 0; y < height; y++)
     {
         png_write_row(png_ptr, (png_const_bytep)(data + y * width * channels));
@@ -262,20 +338,31 @@ static unsigned char* write_png_to_mem_fast(const unsigned char* data,
 }
 #endif
 
+// ============================================================================
+// Task: the unit of work that flows through the pipeline
+// ============================================================================
+// Each Task represents a single image being processed. It carries the input
+// and output file paths, the decoded pixel data (inimage), a pre-allocated
+// output buffer (outimage), and a sequential ID for ordering.
 class Task
 {
    public:
-    int id;
-    int webp;
+    int id;    // Sequential task ID (used for ordering; -233 = sentinel/poison
+               // pill)
+    int webp;  // Flag: 1 if the input was decoded as WebP (affects how we free
+               // the pixel data)
 
-    path_t inpath;
-    path_t outpath;
+    path_t inpath;   // Input file path (or "stdin")
+    path_t outpath;  // Output file path (or "stdout")
 
-    ncnn::Mat inimage;
-    ncnn::Mat outimage;
+    ncnn::Mat inimage;   // Decoded input image pixels (w × h, c channels)
+    ncnn::Mat outimage;  // Pre-allocated output buffer (w*scale × h*scale, c
+                         // channels)
 };
 
-// comparator for priority queue (lower id has higher priority)
+// Comparator for the priority queue: tasks with lower IDs are processed first.
+// This ensures that even if images are loaded out of order, the processing
+// stage picks them up in sequence.
 struct TaskComparator
 {
     bool operator()(const Task& a, const Task& b)
@@ -284,11 +371,18 @@ struct TaskComparator
     }
 };
 
+// ============================================================================
+// TaskQueue: thread-safe priority queue (load → proc)
+// ============================================================================
+// Used by the load thread to submit decoded images to the processing threads.
+// Implements backpressure: blocks producers when the queue reaches 8 items,
+// preventing unbounded memory usage from decoded images piling up.
 class TaskQueue
 {
    public:
     TaskQueue() {}
 
+    // Enqueue a task. Blocks if the queue already has 8 items (backpressure).
     void put(const Task& v)
     {
         lock.lock();
@@ -305,6 +399,8 @@ class TaskQueue
         condition.signal();
     }
 
+    // Dequeue the highest-priority (lowest ID) task. Blocks if the queue is
+    // empty.
     void get(Task& v)
     {
         lock.lock();
@@ -328,11 +424,21 @@ class TaskQueue
     std::priority_queue<Task, std::vector<Task>, TaskComparator> tasks;
 };
 
+// ============================================================================
+// SequentialTaskQueue: thread-safe ordered queue (proc → save)
+// ============================================================================
+// Ensures that save threads process images strictly in order (by ID).
+// Processing threads may complete out of order (especially with multi-GPU),
+// so this queue buffers results until the next expected ID is available.
+// This guarantees that when piping to stdout, images are written in the
+// same order they were read.
 class SequentialTaskQueue
 {
    public:
     SequentialTaskQueue() : next_id(1) {}
 
+    // Enqueue a completed task. Blocks if the buffer has 8 items
+    // (backpressure).
     void put(const Task& v)
     {
         lock.lock();
@@ -349,6 +455,8 @@ class SequentialTaskQueue
         condition.signal();
     }
 
+    // Dequeue the next task in sequence. Blocks until the task with
+    // id == next_id is available, skipping over any that arrived early.
     void get(Task& v)
     {
         lock.lock();
@@ -370,13 +478,20 @@ class SequentialTaskQueue
    private:
     ncnn::Mutex lock;
     ncnn::ConditionVariable condition;
-    std::map<int, Task> tasks;
-    int next_id;
+    std::map<int, Task> tasks;  // Buffered tasks indexed by ID
+    int next_id;                // The next ID we expect to dequeue
 };
 
-TaskQueue toproc;
-SequentialTaskQueue tosave;
+// Global inter-thread queues connecting the pipeline stages
+TaskQueue toproc;            // load → proc
+SequentialTaskQueue tosave;  // proc → save
 
+// ============================================================================
+// stdin binary I/O helpers
+// ============================================================================
+
+// Read exactly `n` bytes from stdin into `buf`.
+// Returns 1 on success, 0 if stdin is exhausted before `n` bytes are read.
 static int read_bytes(unsigned char* buf, size_t n)
 {
     size_t got = 0;
@@ -389,6 +504,19 @@ static int read_bytes(unsigned char* buf, size_t n)
     return 1;
 }
 
+// Read a complete PNG file from stdin by parsing its chunk structure.
+// PNG files consist of an 8-byte signature followed by a series of chunks,
+// each with a 4-byte length, 4-byte type, variable data, and 4-byte CRC.
+// This function reads chunks until it encounters the IEND (end) chunk,
+// assembling the entire PNG into img_buf for later decoding by stb_image.
+//
+// Parameters:
+//   sig_buf  - scratch buffer for the 8-byte PNG signature
+//   len_buf  - scratch buffer for chunk length (4 bytes)
+//   type_buf - scratch buffer for chunk type (4 bytes)
+//   img_buf  - [in/out] dynamically growing buffer for the entire PNG file
+//   buf_cap  - [in/out] current allocated capacity of img_buf
+//   buf_len  - [in/out] current number of valid bytes in img_buf
 void read_png(unsigned char* sig_buf,
               unsigned char* len_buf,
               unsigned char* type_buf,
@@ -396,10 +524,11 @@ void read_png(unsigned char* sig_buf,
               size_t& buf_cap,
               size_t& buf_len)
 {
+    // Expected PNG file signature (magic bytes)
     const static unsigned char png_sig[8] = {0x89, 'P',  'N',  'G',
                                              0x0D, 0x0A, 0x1A, 0x0A};
 
-    // signature
+    // Read and validate the 8-byte PNG signature
     if (!read_bytes(sig_buf, 8)) return;
     if (memcmp(sig_buf, png_sig, 8))
     {
@@ -422,23 +551,26 @@ void read_png(unsigned char* sig_buf,
     memcpy(img_buf, sig_buf, 8);
     buf_len = 8;
 
-    // read chunks until IEND
+    // Read PNG chunks one at a time until we hit the IEND terminator.
+    // Each chunk: [4-byte length][4-byte type][length bytes data][4-byte CRC]
     for (;;)
     {
         if (!read_bytes(len_buf, 4)) return;
         if (!read_bytes(type_buf, 4)) return;
-        // chunk length (big-endian)
+        // Decode chunk data length from big-endian 4-byte field
         uint32_t chunk_len = (len_buf[0] << 24) | (len_buf[1] << 16) |
                              (len_buf[2] << 8) | len_buf[3];
 
-        // validate chunk length to prevent overflow and excessive allocation
+        // Sanity-check chunk length to prevent excessive allocation
+        // or integer overflow (max ~100 MB per chunk)
         if (chunk_len > 0x7FFFFFFF || chunk_len > 100 * 1024 * 1024)
         {
             fprintf(stderr, "PNG chunk too large: %u bytes\n", chunk_len);
             return;
         }
 
-        // ensure capacity
+        // Grow the buffer to fit: length(4) + type(4) + data(chunk_len) +
+        // CRC(4)
         size_t needed = buf_len + 4 + 4 + chunk_len + 4;
         if (needed > buf_cap)
         {
@@ -458,20 +590,20 @@ void read_png(unsigned char* sig_buf,
             }
             img_buf = new_buf;
         }
-        // copy length+type
+        // Append chunk length and type to the buffer
         memcpy(img_buf + buf_len, len_buf, 4);
         buf_len += 4;
         memcpy(img_buf + buf_len, type_buf, 4);
         buf_len += 4;
 
-        // copy data
+        // Append chunk data directly into the buffer from stdin
         if (!read_bytes(img_buf + buf_len, chunk_len)) return;
         buf_len += chunk_len;
-        // copy CRC
+        // Append the 4-byte CRC
         if (!read_bytes(img_buf + buf_len, 4)) return;
         buf_len += 4;
 
-        // check for IEND
+        // IEND marks the end of the PNG file
         if (memcmp(type_buf, "IEND", 4) == 0)
         {
             break;
@@ -479,30 +611,53 @@ void read_png(unsigned char* sig_buf,
     }
 }
 
+// ============================================================================
+// Thread parameter structures
+// ============================================================================
+
+// Parameters passed to the load thread function.
 class LoadThreadParams
 {
    public:
-    int scale;
-    int jobs_load;
-    int use_stdin;
-    int use_stdout;
+    int scale;  // Upscale factor (2, 3, or 4) — needed to pre-allocate output
+                // buffer
+    int jobs_load;   // Number of load jobs (currently unused within load(),
+                     // always 1 thread)
+    int use_stdin;   // If true, read images from stdin instead of files
+    int use_stdout;  // If true, output path is set to "stdout"
 
-    // session data
+    // Lists of input/output file paths (parallel arrays, same length)
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
 };
 
+// ============================================================================
+// Load thread: decodes input images and submits them for processing
+// ============================================================================
+// Runs on a single thread. For each input image:
+//   1. Reads the raw file data (from disk or stdin)
+//   2. Attempts WebP decoding first, then falls back to stb_image (PNG/JPG)
+//   3. Normalizes channel count (grayscale→RGB, gray+alpha→RGBA)
+//   4. Wraps pixel data in an ncnn::Mat and pre-allocates the output Mat
+//   5. Pushes the Task into the toproc queue
+//
+// When reading from stdin, the loop runs indefinitely (count increments on
+// each successful decode) until stdin is exhausted (read_bytes returns 0).
 void* load(void* args)
 {
     const LoadThreadParams* ltp = (const LoadThreadParams*)args;
     const int scale = ltp->scale;
 
+    // Determine how many images to process:
+    // - stdin mode: starts at 1, incremented after each successful read
+    // - file mode: number of input files
     int count;
     if (ltp->use_stdin)
         count = 1;
     else
         count = ltp->input_files.size();
 
+    // Scratch buffers for PNG stdin reading
     unsigned char sig_buf[8];
     unsigned char len_buf[4], type_buf[4];
     unsigned char* img_buf = NULL;
@@ -511,15 +666,16 @@ void* load(void* args)
     int i = 0;
     while (i++ < count)
     {
-        int webp = 0;
+        int webp = 0;  // Track whether this image was decoded as WebP
 
         unsigned char* pixeldata = 0;
-        int w;
-        int h;
-        int c;
+        int w;  // image width
+        int h;  // image height
+        int c;  // number of channels (1=gray, 3=RGB, 4=RGBA)
 
         FILE* fp = NULL;
 
+        // Open input file (skip if reading from stdin)
         if (!ltp->use_stdin)
         {
 #if _WIN32
@@ -531,7 +687,8 @@ void* load(void* args)
 
         if (fp)
         {
-            // read whole file
+            // Read the entire file into memory for format detection and
+            // decoding
             unsigned char* filedata = 0;
             int length = 0;
             {
@@ -548,6 +705,8 @@ void* load(void* args)
 
             if (filedata)
             {
+                // Try WebP decoding first (webp_load returns non-NULL on
+                // success)
                 pixeldata = webp_load(filedata, length, &w, &h, &c);
                 if (pixeldata)
                 {
@@ -555,7 +714,7 @@ void* load(void* args)
                 }
                 else
                 {
-                    // not webp, try jpg png etc.
+                    // Not WebP — fall back to stb_image for PNG, JPG, BMP, etc.
 #if _WIN32
                     pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
 #else   // _WIN32
@@ -563,10 +722,12 @@ void* load(void* args)
                         stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
                     if (pixeldata)
                     {
-                        // stb_image auto channel
+                        // Normalize uncommon channel counts to standard
+                        // RGB/RGBA. The neural network expects 3 or 4 channel
+                        // input.
                         if (c == 1)
                         {
-                            // grayscale -> rgb
+                            // grayscale -> rgb (reload forcing 3 channels)
                             stbi_image_free(pixeldata);
                             pixeldata = stbi_load_from_memory(filedata, length,
                                                               &w, &h, &c, 3);
@@ -574,7 +735,8 @@ void* load(void* args)
                         }
                         else if (c == 2)
                         {
-                            // grayscale + alpha -> rgba
+                            // grayscale + alpha -> rgba (reload forcing 4
+                            // channels)
                             stbi_image_free(pixeldata);
                             pixeldata = stbi_load_from_memory(filedata, length,
                                                               &w, &h, &c, 4);
@@ -587,14 +749,15 @@ void* load(void* args)
                 free(filedata);
             }
         }
-        // read from stdin
+        // Read image from stdin (PNG format expected)
         else if (ltp->use_stdin)
         {
+            // Read a complete PNG from stdin into img_buf, then decode it
             read_png(sig_buf, len_buf, type_buf, img_buf, buf_cap, buf_len);
             pixeldata = stbi_load_from_memory(img_buf, buf_len, &w, &h, &c, 0);
             if (pixeldata)
             {
-                // stb_image auto channel
+                // Same channel normalization as file path above
                 if (c == 1)
                 {
                     // grayscale -> rgb
@@ -616,6 +779,7 @@ void* load(void* args)
 
         if (pixeldata)
         {
+            // Build a Task object to send through the pipeline
             Task v;
             v.id = i;
             if (ltp->use_stdin)
@@ -628,9 +792,14 @@ void* load(void* args)
             else
                 v.outpath = ltp->output_files[i];
 
+            // Wrap decoded pixels in ncnn::Mat (does NOT copy; Mat borrows the
+            // pointer). Pre-allocate output Mat at the upscaled resolution.
             v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
             v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)c, c);
 
+            // JPEG does not support alpha channels — if the image has 4
+            // channels and the output format is JPEG, override the output to
+            // PNG and warn.
             path_t ext = get_file_extension(v.outpath);
             if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") ||
                            ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
@@ -651,8 +820,12 @@ void* load(void* args)
 #endif  // _WIN32
             }
 
+            // Submit the task to processing threads
             toproc.put(v);
 
+            // In stdin mode, free the PNG read buffer and prepare for the next
+            // image. Incrementing `count` allows the loop to continue
+            // indefinitely until stdin is exhausted.
             if (ltp->use_stdin)
             {
                 if (img_buf)
@@ -677,6 +850,7 @@ void* load(void* args)
         }
     }
 
+    // Clean up any remaining stdin buffer
     if (img_buf)
     {
         free(img_buf);
@@ -686,12 +860,27 @@ void* load(void* args)
     return 0;
 }
 
+// Parameters passed to each processing thread.
 class ProcThreadParams
 {
    public:
-    const RealESRGAN* realesrgan;
+    const RealESRGAN*
+        realesrgan;  // Pointer to the RealESRGAN instance for this GPU
 };
 
+// ============================================================================
+// Proc thread: runs neural network inference on each image
+// ============================================================================
+// Multiple proc threads can run in parallel (one or more per GPU).
+// Each thread:
+//   1. Dequeues a task from `toproc`
+//   2. Runs Real-ESRGAN inference (v.inimage → v.outimage)
+//   3. Enqueues the result into `tosave`
+//   4. Exits when it receives the poison pill (id == -233)
+//
+// The RealESRGAN::process() method internally handles tiling (splitting
+// large images into overlapping tiles), GPU memory management, and
+// neural network forward passes via ncnn's Vulkan backend.
 void* proc(void* args)
 {
     const ProcThreadParams* ptp = (const ProcThreadParams*)args;
@@ -703,23 +892,40 @@ void* proc(void* args)
 
         toproc.get(v);
 
+        // Poison pill: signals this thread to shut down
         if (v.id == -233) break;
 
+        // Run the super-resolution neural network
         realesrgan->process(v.inimage, v.outimage);
 
+        // Forward the result to the save stage
         tosave.put(v);
     }
 
     return 0;
 }
 
+// Parameters passed to each save thread.
 class SaveThreadParams
 {
    public:
-    int verbose;
-    int use_stdout;
+    int verbose;     // If true, print "input -> output done" messages
+    int use_stdout;  // If true, write PNG to stdout instead of files
 };
 
+// ============================================================================
+// Save thread: encodes and writes upscaled images to disk or stdout
+// ============================================================================
+// Multiple save threads can run in parallel for file output. For stdout mode,
+// the SequentialTaskQueue guarantees images are saved in the correct order.
+//
+// Each thread:
+//   1. Dequeues a task from `tosave` (blocks until the next sequential ID is
+//   ready)
+//   2. Frees the input pixel data (no longer needed after processing)
+//   3. Encodes the output image in the appropriate format (PNG/JPG/WebP)
+//   4. Writes to file or stdout
+//   5. Exits when it receives the poison pill (id == -233)
 void* save(void* args)
 {
     const SaveThreadParams* stp = (const SaveThreadParams*)args;
@@ -731,9 +937,13 @@ void* save(void* args)
 
         tosave.get(v);
 
+        // Poison pill: signals this thread to shut down
         if (v.id == -233) break;
 
-        // free input pixel data
+        // Free input pixel data — the upscaled output is in v.outimage now.
+        // WebP-decoded data was allocated with malloc(), while stb_image data
+        // must be freed with stbi_image_free() (which may differ on some
+        // platforms).
         {
             unsigned char* pixeldata = (unsigned char*)v.inimage.data;
             if (v.webp == 1)
@@ -757,7 +967,8 @@ void* save(void* args)
         {
             ext = get_file_extension(v.outpath);
 
-            /* ----------- Create folder if not exists -------------------*/
+            // Ensure the output directory exists, creating it recursively if
+            // needed
             fs::path fs_path = fs::absolute(v.outpath);
             std::string parent_path = fs_path.parent_path().string();
             if (fs::exists(parent_path) != 1)
@@ -768,8 +979,11 @@ void* save(void* args)
             }
         }
 
+        // Encode and write the output image based on format
         if (stp->use_stdout)
         {
+            // stdout mode: always output PNG (fastest with zero-compression
+            // libpng)
             int len;
 #if _WIN32
             unsigned char* png = stbi_write_png_to_mem(
@@ -800,12 +1014,14 @@ void* save(void* args)
         }
         else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
         {
+            // WebP output encoding
             success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h,
                                 v.outimage.elempack,
                                 (const unsigned char*)v.outimage.data);
         }
         else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
         {
+            // PNG output encoding
 #if _WIN32
             success =
                 wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h,
@@ -819,6 +1035,7 @@ void* save(void* args)
         else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") ||
                  ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
         {
+            // JPEG output encoding (quality=100 for maximum fidelity)
 #if _WIN32
             success = wic_encode_jpeg_image(v.outpath.c_str(), v.outimage.w,
                                             v.outimage.h, v.outimage.elempack,
@@ -855,26 +1072,39 @@ void* save(void* args)
     return 0;
 }
 
+// ============================================================================
+// Main entry point
+// ============================================================================
+// Orchestrates the entire upscaling pipeline:
+//   1. Parse command-line arguments
+//   2. Validate inputs and resolve file paths
+//   3. Initialize Vulkan GPU instance(s) and RealESRGAN model(s)
+//   4. Launch load, proc, and save threads
+//   5. Wait for completion and clean up
 #if _WIN32
 int wmain(int argc, wchar_t** argv)
 #else
 int main(int argc, char** argv)
 #endif
 {
+    // ---- Default configuration values ----
     path_t inputpath;
     path_t outputpath;
-    int scale = 4;
-    std::vector<int> tilesize;
-    path_t model = PATHSTR("models");
-    path_t modelname = PATHSTR("realesr-animevideov3");
-    std::vector<int> gpuid;
-    int jobs_load = 1;
-    std::vector<int> jobs_proc;
-    int jobs_save = 2;
-    int verbose = 0;
-    int tta_mode = 0;
-    path_t format = PATHSTR("png");
+    int scale = 4;                     // Default upscale factor
+    std::vector<int> tilesize;         // Per-GPU tile sizes (0 = auto)
+    path_t model = PATHSTR("models");  // Directory containing model files
+    path_t modelname =
+        PATHSTR("realesr-animevideov3");  // Default model (anime-optimized)
+    std::vector<int> gpuid;               // GPU device IDs to use
+    int jobs_load = 1;                    // Number of image loading threads
+    std::vector<int> jobs_proc;           // Per-GPU processing thread counts
+    int jobs_save = 2;                    // Number of image saving threads
+    int verbose = 0;                      // Verbose logging flag
+    int tta_mode =
+        0;  // Test-Time Augmentation (8x slower, slightly better quality)
+    path_t format = PATHSTR("png");  // Default output format
 
+    // ---- Parse command-line arguments ----
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
@@ -904,6 +1134,9 @@ int main(int argc, char** argv)
                 gpuid = parse_optarg_int_array(optarg);
                 break;
             case L'j':
+                // Parse "load:proc:save" thread counts.
+                // The proc part can be comma-separated for multi-GPU (e.g.
+                // "1:2,2,2:2").
                 swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
                 jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
                 break;
@@ -950,6 +1183,9 @@ int main(int argc, char** argv)
                 gpuid = parse_optarg_int_array(optarg);
                 break;
             case 'j':
+                // Parse "load:proc:save" thread counts.
+                // The proc part can be comma-separated for multi-GPU (e.g.
+                // "1:2,2,2:2").
                 sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
                 jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
                 break;
@@ -970,6 +1206,7 @@ int main(int argc, char** argv)
     }
 #endif  // _WIN32
 
+    // ---- Configure stdin/stdout mode when paths are omitted ----
     if (inputpath.empty())
     {
         fprintf(stderr, "using stdin as input\n");
@@ -978,9 +1215,13 @@ int main(int argc, char** argv)
     if (outputpath.empty())
     {
         fprintf(stderr, "using stdout as output\n");
+        // Disable stb PNG compression for faster stdout writing
         stbi_write_png_compression_level = 0;
     }
 
+    // ---- Validate arguments ----
+
+    // Tile size count must match GPU count (one tile size per GPU)
     if (tilesize.size() != (gpuid.empty() ? 1 : gpuid.size()) &&
         !tilesize.empty())
     {
@@ -988,6 +1229,7 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    // Tile size must be 0 (auto) or at least 32 pixels
     for (int i = 0; i < (int)tilesize.size(); i++)
     {
         if (tilesize[i] != 0 && tilesize[i] < 32)
@@ -997,12 +1239,14 @@ int main(int argc, char** argv)
         }
     }
 
+    // Thread counts must be positive
     if (jobs_load < 1 || jobs_save < 1)
     {
         fprintf(stderr, "invalid thread count argument\n");
         return -1;
     }
 
+    // Processing thread count must match GPU count
     if (jobs_proc.size() != (gpuid.empty() ? 1 : gpuid.size()) &&
         !jobs_proc.empty())
     {
@@ -1019,6 +1263,9 @@ int main(int argc, char** argv)
         }
     }
 
+    // ---- Determine output format ----
+    // When a single output file is specified (not a directory), infer the
+    // format from the file extension, ignoring the -f argument.
     if (!path_is_directory(outputpath) && !outputpath.empty())
     {
         // guess format from outputpath no matter what format argument specified
@@ -1051,12 +1298,16 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    // collect input and output filepath
+    // ---- Collect input and output file paths ----
+    // Supports two modes:
+    //   1. Directory→Directory: processes all images in the input directory
+    //   2. File→File: processes a single image
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
     {
         if (path_is_directory(inputpath) && path_is_directory(outputpath))
         {
+            // Batch mode: list all files in input directory
             std::vector<path_t> filenames;
             int lr = list_directory(inputpath, filenames);
             if (lr != 0) return -1;
@@ -1065,6 +1316,9 @@ int main(int argc, char** argv)
             input_files.resize(count);
             output_files.resize(count);
 
+            // Track previous filename to detect collisions (e.g. foo.png and
+            // foo.jpg would both produce foo.png output). When detected, append
+            // the original extension to disambiguate (e.g. foo.jpg.png).
             path_t last_filename;
             path_t last_filename_noext;
             for (int i = 0; i < count; i++)
@@ -1107,6 +1361,7 @@ int main(int argc, char** argv)
         else if (!path_is_directory(inputpath) &&
                  !path_is_directory(outputpath))
         {
+            // Single-file mode
             input_files.push_back(inputpath);
             output_files.push_back(outputpath);
         }
@@ -1119,6 +1374,10 @@ int main(int argc, char** argv)
         }
     }
 
+    // ---- Set model-specific pre-padding ----
+    // Pre-padding is extra border pixels added around each tile before
+    // inference to avoid edge artifacts from the neural network's receptive
+    // field.
     int prepadding = 0;
 
     if (model.find(PATHSTR("models")) != path_t::npos ||
@@ -1132,6 +1391,8 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    // Previously used for model name validation; commented out to allow
+    // custom model names without restriction.
     // if (modelname.find(PATHSTR("realesrgan-x4plus")) != path_t::npos
     //     || modelname.find(PATHSTR("realesrnet-x4plus")) != path_t::npos
     //     || modelname.find(PATHSTR("esrgan-x4")) != path_t::npos)
@@ -1142,6 +1403,10 @@ int main(int argc, char** argv)
     //     return -1;
     // }
 
+    // ---- Construct model file paths ----
+    // The animevideov3 model has scale-specific weights (e.g.
+    // realesr-animevideov3-x2.bin), while other models have a single weight
+    // file for all scales.
 #if _WIN32
     wchar_t parampath[256];
     wchar_t modelpath[256];
@@ -1179,15 +1444,18 @@ int main(int argc, char** argv)
     }
 #endif
 
+    // Resolve relative paths and normalize separators
     path_t paramfullpath = sanitize_filepath(parampath);
     path_t modelfullpath = sanitize_filepath(modelpath);
 
+    // ---- Initialize Vulkan GPU runtime ----
 #if _WIN32
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
 
     ncnn::create_gpu_instance();
 
+    // Default to the first available GPU if none specified
     if (gpuid.empty())
     {
         gpuid.push_back(ncnn::get_default_gpu_index());
@@ -1195,23 +1463,28 @@ int main(int argc, char** argv)
 
     const int use_gpu_count = (int)gpuid.size();
 
+    // Default to 2 processing threads per GPU if not specified
     if (jobs_proc.empty())
     {
         jobs_proc.resize(use_gpu_count, 2);
     }
 
+    // Default tile size to 0 (auto) for each GPU if not specified
     if (tilesize.empty())
     {
         tilesize.resize(use_gpu_count, 0);
     }
 
+    // Cap load/save thread counts to the number of CPU cores available
     int cpu_count = std::max(1, ncnn::get_cpu_count());
     jobs_load = std::min(jobs_load, cpu_count);
     jobs_save = std::min(jobs_save, cpu_count);
 
+    // stdin/stdout modes are inherently single-threaded (serial I/O)
     if (inputpath.empty()) jobs_load = 1;
     if (outputpath.empty()) jobs_save = 1;
 
+    // Validate that all requested GPU IDs exist
     int gpu_count = ncnn::get_gpu_count();
     for (int i = 0; i < use_gpu_count; i++)
     {
@@ -1224,6 +1497,8 @@ int main(int argc, char** argv)
         }
     }
 
+    // Cap processing threads per GPU to the GPU's available compute queues.
+    // Having more threads than queues provides no benefit and wastes resources.
     int total_jobs_proc = 0;
     for (int i = 0; i < use_gpu_count; i++)
     {
@@ -1233,9 +1508,13 @@ int main(int argc, char** argv)
         total_jobs_proc += jobs_proc[i];
     }
 
+    // ---- Auto-detect tile size based on GPU VRAM budget ----
+    // Larger tiles are more efficient but require more VRAM. This heuristic
+    // selects the largest tile size that fits in the available memory.
     for (int i = 0; i < use_gpu_count; i++)
     {
-        if (tilesize[i] != 0) continue;
+        if (tilesize[i] != 0)
+            continue;  // User specified a tile size, skip auto
 
         uint32_t heap_budget =
             ncnn::get_gpu_device(gpuid[i])->get_heap_budget();
@@ -1254,7 +1533,12 @@ int main(int argc, char** argv)
         }
     }
 
+    // ============================================================================
+    // Main processing pipeline
+    // ============================================================================
     {
+        // Create one RealESRGAN instance per GPU, each loading the same model
+        // but configured with GPU-specific tile size and device ID.
         std::vector<RealESRGAN*> realesrgan(use_gpu_count);
 
         for (int i = 0; i < use_gpu_count; i++)
@@ -1268,9 +1552,9 @@ int main(int argc, char** argv)
             realesrgan[i]->prepadding = prepadding;
         }
 
-        // main routine
+        // ---- Launch the three-stage thread pipeline ----
         {
-            // load image
+            // Stage 1: Image loading thread
             LoadThreadParams ltp;
             ltp.scale = scale;
             ltp.jobs_load = jobs_load;
@@ -1289,7 +1573,7 @@ int main(int argc, char** argv)
 
             ncnn::Thread load_thread(load, (void*)&ltp);
 
-            // realesrgan proc
+            // Stage 2: GPU processing threads (one or more per GPU)
             std::vector<ProcThreadParams> ptp(use_gpu_count);
             for (int i = 0; i < use_gpu_count; i++)
             {
@@ -1309,7 +1593,7 @@ int main(int argc, char** argv)
                 }
             }
 
-            // save image
+            // Stage 3: Image saving threads
             SaveThreadParams stp;
             stp.verbose = verbose;
             if (outputpath.empty())
@@ -1323,9 +1607,14 @@ int main(int argc, char** argv)
                 save_threads[i] = new ncnn::Thread(save, (void*)&stp);
             }
 
-            // end
+            // ---- Graceful shutdown sequence ----
+
+            // Wait for the load thread to finish reading all input images
             load_thread.join();
 
+            // Send poison pills (id == -233) to all proc threads to signal
+            // shutdown. One poison pill per proc thread ensures each thread
+            // receives exactly one.
             Task end;
             end.id = -233;
 
@@ -1334,17 +1623,21 @@ int main(int argc, char** argv)
                 toproc.put(end);
             }
 
+            // Wait for all proc threads to finish processing and shut down
             for (int i = 0; i < total_jobs_proc; i++)
             {
                 proc_threads[i]->join();
                 delete proc_threads[i];
             }
 
+            // Send poison pills to all save threads (proc is done, so all
+            // results have been forwarded to tosave by now)
             for (int i = 0; i < jobs_save; i++)
             {
                 tosave.put(end);
             }
 
+            // Wait for all save threads to finish writing output images
             for (int i = 0; i < jobs_save; i++)
             {
                 save_threads[i]->join();
@@ -1352,6 +1645,7 @@ int main(int argc, char** argv)
             }
         }
 
+        // Clean up RealESRGAN model instances (releases GPU resources)
         for (int i = 0; i < use_gpu_count; i++)
         {
             delete realesrgan[i];
@@ -1359,6 +1653,7 @@ int main(int argc, char** argv)
         realesrgan.clear();
     }
 
+    // Tear down the Vulkan GPU runtime
     ncnn::destroy_gpu_instance();
 
     return 0;
